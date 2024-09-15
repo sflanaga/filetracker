@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -35,7 +36,6 @@ func ConnectToDB(dbPath string) (*sql.DB, error) {
 func CreateTable(db *sql.DB) error {
 	query := `
 	CREATE TABLE IF NOT EXISTS files (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		scan_timestamp TIMESTAMP,
 		filename TEXT,
 		filehash TEXT,
@@ -63,14 +63,14 @@ func CalculateFileHash(filePath string) (string, error) {
 
 // InsertFileInfo inserts file details into the DuckDB database
 func InsertFileInfo(db *sql.DB, fileInfo FileInfo) error {
-	query := `
-	INSERT INTO files (scan_timestamp, filename, filehash, modification_timestamp, size)
+	query := `INSERT INTO files (scan_timestamp, filename, filehash, modification_timestamp, size)
 	VALUES (?, ?, ?, ?, ?)`
-	_, err := db.Exec(query, fileInfo.ScanTimestamp, fileInfo.Filename, fileInfo.FileHash, fileInfo.ModTime, fileInfo.Size)
+	// fmt.Printf("DB write: %v\n", fileInfo)
+	_, err := dbTx.ExecContext(context.Background(), query, fileInfo.ScanTimestamp, fileInfo.Filename, fileInfo.FileHash, fileInfo.ModTime, fileInfo.Size)
 	return err
 }
 
-func main() {
+func db_main() {
 	// Path to your DuckDB database
 	dbPath := "mydatabase.duckdb"
 

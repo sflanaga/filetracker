@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"crypto/sha1"
+	"database/sql"
 	"flag"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -19,6 +21,9 @@ import (
 	"github.com/sflanaga/statticker"
 	"golang.org/x/sync/semaphore"
 )
+
+var hashpool *pond.WorkerPool
+var dbpool *pond.WorkerPool
 
 func computeSHA1(filePath string) (string, error) {
 	// Open the file for reading
@@ -69,6 +74,8 @@ func modeToStringLong(mode fs.FileMode) string {
 
 var ptrOutputFile *os.File
 var mtxOutputFile sync.Mutex
+var dbConn *sql.DB
+var dbTx *sql.Tx
 
 func safePrintf(format string, a ...any) {
 	mtxOutputFile.Lock()
@@ -95,6 +102,8 @@ var notDirOrFile uint64 = 0
 var filterDirs uint64 = 0
 var dirListErrors uint64 = 0
 
+var startTime = time.Now()
+
 func shaWorker(id int, jobs <-chan string) {
 	for filename := range jobs {
 		sha1, err := computeSHA1(filename)
@@ -106,7 +115,7 @@ func shaWorker(id int, jobs <-chan string) {
 	}
 }
 
-func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, pool *pond.WorkerPool, goroutine bool, depth int) {
+func walkGo(db *sql.DB, debug bool, dir string, limitworkers *semaphore.Weighted, goroutine bool, depth int) {
 	if goroutine {
 		// we need to release the allocated thread/goroutine if we stop early
 		// we only need to do this when we did NOT steal the next directory/task
@@ -147,33 +156,45 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, pool *pond
 			countDirs.Add(1)
 
 			if limitworkers.TryAcquire(1) {
-				go walkGo(debug, cleanPath, limitworkers, pool, true, depth+1)
+				go walkGo(dbConn, debug, cleanPath, limitworkers, true, depth+1)
 			} else {
-				walkGo(debug, cleanPath, limitworkers, pool, false, depth+1)
+				walkGo(dbConn, debug, cleanPath, limitworkers, false, depth+1)
 			}
 		} else if file.Type().IsRegular() || (fs.ModeIrregular&file.Type() != 0) {
-			// stats, err_st := file.Info()
-			// if err_st != nil {
-			// 	atomic.AddUint64(&filestatErrors, 1)
-			// 	if debug {
-			// 		fmt.Fprintln(os.Stderr, "... Error reading file info:", err_st)
-			// 	}
-			// 	continue
-			// }
-			// sz := stats.Size()
+			stats, err_st := file.Info()
+			if err_st != nil {
+				atomic.AddUint64(&filestatErrors, 1)
+				if debug {
+					fmt.Fprintln(os.Stderr, "... Error reading file info:", err_st)
+				}
+				continue
+			}
 			safePrintf("toscan: %s\n", cleanPath)
 			blocked.Add(1)
-			pool.Submit(func() {
+			modTime := stats.ModTime()
+			sz := stats.Size()
+			hashpool.Submit(func() {
 				goroutines.Add(1)
 				sha1, err := computeSHA1(cleanPath)
+				fileInfo := FileInfo{
+					ScanTimestamp: startTime, // Current timestamp as scan timestamp
+					Filename:      cleanPath,
+					FileHash:      sha1,
+					ModTime:       modTime,
+					Size:          sz,
+				}
+
 				goroutines.Add(-1)
 				if err == nil {
 					countFiles.Add(1)
-					safePrintf("scanned: %s = %s\n", cleanPath, string(sha1))
+					safePrintf("scanned: %s | %s | %v | %d\n", fileInfo.Filename, fileInfo.FileHash, fileInfo.ModTime, fileInfo.Size)
 				} else {
 					safePrintf("scanned: %s FaIleD: %s\n", cleanPath, err.Error())
 					fmt.Errorf("sha1 error for file \"%s\" of: %s\n", cleanPath, err.Error())
 				}
+				dbpool.Submit(func() {
+					InsertFileInfo(dbConn, fileInfo)
+				})
 			})
 			blocked.Add(-1)
 			// uid := getUserId(&stats)
@@ -203,7 +224,9 @@ func main() {
 
 	// start := time.Now()
 
-	rootDir := flag.String("d", ".", "root directory to scan")
+	var err error
+
+	_rootDir := flag.String("d", ".", "root directory to scan")
 	ticker_duration := flag.Duration("i", 1*time.Second, "ticker duration")
 	// dumpFullDetails := flag.Bool("D", false, "dump full details")
 	// flatUnits := flag.Bool("F", false, "use basic units for size and age - useful for simpler post processing")
@@ -212,15 +235,48 @@ func main() {
 	debug := flag.Bool("v", false, "keep intermediate error messages quiet")
 	outputFilename := flag.String("f", "sha1.log", "output file to write sha1 per file")
 
+	flag.Usage = func() {
+		fmt.Printf("Usage: %s [OPTIONS]\n", path.Base(os.Args[0]))
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	rootDir, err := filepath.Abs(*_rootDir)
+	if err != nil {
+		fmt.Println("Error getting absolute path:", err)
+		return
+	}
+
 	ofile, err := os.OpenFile(*outputFilename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		fmt.Println("Error opening file:", err)
 		return
 	}
 
-	ptrOutputFile = ofile
+	dbPath := "mydatabase.duckdb"
 
-	pool := pond.New(*threadLimit, *threadLimit*4)
+	// Connect to the database
+	dbConn, err = ConnectToDB(dbPath)
+	if err != nil {
+		log.Fatalf("Failed to connect to the database: %v", err)
+	}
+	defer dbConn.Close()
+
+	dbTx, err = dbConn.BeginTx(context.Background(), nil)
+	if err != nil {
+		log.Fatalf("Failed to start transaction on database: %v", err)
+	}
+	defer dbTx.Commit()
+
+	// Create the table if it doesn't exist
+	if err := CreateTable(dbConn); err != nil {
+		log.Fatalf("Failed to create table: %v", err)
+	}
+
+	hashpool = pond.New(*threadLimit, *threadLimit*4, pond.MinWorkers(*threadLimit))
+	dbpool = pond.New(1, *threadLimit*100, pond.MinWorkers(1))
+
+	ptrOutputFile = ofile
 
 	// jobs := make(chan string, *threadLimit*2)
 	// for i := 0; i < *threadLimit; i++ {
@@ -228,12 +284,6 @@ func main() {
 	// }
 
 	var workerSema = semaphore.NewWeighted(int64(*threadLimit))
-
-	flag.Usage = func() {
-		fmt.Printf("Usage: %s [OPTIONS]\n", path.Base(os.Args[0]))
-		flag.PrintDefaults()
-	}
-	flag.Parse()
 
 	var statList []*statticker.Stat
 	statList = append(statList, countFiles)
@@ -249,12 +299,19 @@ func main() {
 	}
 	var ctx = context.Background()
 	workerSema.Acquire(ctx, 1)
-	walkGo(*debug, *rootDir, workerSema, pool, true, 0)
+	fmt.Println("scanning dir: ", rootDir)
+	walkGo(dbConn, *debug, rootDir, workerSema, true, 0)
 	workerSema.Acquire(ctx, int64(*threadLimit))
-	pool.StopAndWait()
+	hashpool.StopAndWait()
 	ticker.Stop()
 
 }
 
 // OVERALL[stats monitor] 390.863  files: 1,058/s, 413,891 dir: 113/s, 44,463 bytes: 1.36GB/s, 533.18GB goroutines: 0
 // OVERALL[stats monitor] 372.238  files: 1,113/s, 414,428 dir: 119/s, 44,463 bytes: 1.43GB/s, 533.38GB goroutines: 0
+
+// perl -ne 'if ( s/scanned: (.+) = .+/$1/) { print $_;}' sha1.log | sort -T /dev/shm > scanned
+
+// perl -ne 'if ( s/toscan: (.+)/$1/) { print $_;}' sha1.log | sort -T /dev/shm > toscan
+
+// 8414e1ffd1d5bcc80db9918042a492f65181bfbe
