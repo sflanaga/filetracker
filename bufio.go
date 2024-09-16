@@ -47,7 +47,7 @@ func thisCopyBuffer(dst io.Writer, src io.Reader, buf []byte) (written int64, er
 				}
 			}
 			written += int64(nw)
-			totalSize.Add(int64(nw))
+			gTotalSize.Add(int64(nw))
 			if ew != nil {
 				err = ew
 				break

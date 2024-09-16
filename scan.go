@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/sha1"
-	"database/sql"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -22,8 +21,8 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-var hashpool *pond.WorkerPool
-var dbpool *pond.WorkerPool
+var gHashpool *pond.WorkerPool
+var gDbpool *pond.WorkerPool
 
 func computeSHA1(filePath string) (string, error) {
 	// Open the file for reading
@@ -72,37 +71,45 @@ func modeToStringLong(mode fs.FileMode) string {
 	return "unknown"
 }
 
-var ptrOutputFile *os.File
-var mtxOutputFile sync.Mutex
-var dbConn *sql.DB
-var dbTx *sql.Tx
+var gPtrOutputFile *os.File
+var gMtxOutputFile sync.Mutex
+
+var gDbi *DbInfo
+
+// var dbConn *sql.DB
+// var dbTx *sql.Tx
 
 func safePrintf(format string, a ...any) {
-	mtxOutputFile.Lock()
-	defer mtxOutputFile.Unlock()
-	fmt.Fprintf(ptrOutputFile, format, a...)
+	gMtxOutputFile.Lock()
+	defer gMtxOutputFile.Unlock()
+	fmt.Fprintf(gPtrOutputFile, format, a...)
 }
 
-var totalSize = statticker.NewStat("bytes", statticker.Bytes)
-var countFiles = statticker.NewStat("files", statticker.Count)
-var countDirs = statticker.NewStat("dir", statticker.Count)
-var goroutines = statticker.NewStat("goroutines", statticker.Gauge)
-var blocked = statticker.NewStat("blocked", statticker.Gauge)
+func getThreadCount() int64 {
+	return int64(runtime.NumGoroutine())
+}
 
-var countFileTypes = xsync.NewMapOf[fs.FileMode, int]()
+var gTotalSize = statticker.NewStat("bytes", statticker.Bytes)
+var gCountFiles = statticker.NewStat("files", statticker.Count)
+var gCountDirs = statticker.NewStat("dir", statticker.Count)
+var gWalkers = statticker.NewStat("walk", statticker.Gauge)
+var gHashers = statticker.NewStat("hash", statticker.Gauge)
+var gThreads = statticker.NewStat("threads", statticker.Gauge).WithExternal(getThreadCount)
 
-var fsFilter = map[string]bool{
+var gCountFileTypes = xsync.NewMapOf[fs.FileMode, int]()
+
+var cFsFilter = map[string]bool{
 	"/proc": true,
 	"/dev":  true,
 	"/sys":  true,
 }
 
-var filestatErrors uint64 = 0
-var notDirOrFile uint64 = 0
-var filterDirs uint64 = 0
-var dirListErrors uint64 = 0
+var gFilestatErrors uint64 = 0
+var gNotDirOrFile uint64 = 0
+var gFilterDirs uint64 = 0
+var gDirListErrors uint64 = 0
 
-var startTime = time.Now()
+var gStartTime = time.Now()
 
 func shaWorker(id int, jobs <-chan string) {
 	for filename := range jobs {
@@ -115,25 +122,17 @@ func shaWorker(id int, jobs <-chan string) {
 	}
 }
 
-func walkGo(db *sql.DB, debug bool, dir string, limitworkers *semaphore.Weighted, goroutine bool, depth int) {
+func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine bool, depth int) {
 	if goroutine {
-		// we need to release the allocated thread/goroutine if we stop early
-		// we only need to do this when we did NOT steal the next directory/task
-		// also note that defer DOES work conditionally here because it works at
-		// the end of the current function and NOT the current scope
-
-		// goroutines.Add(1)
-		// defer goroutines.Add(-1)
-
+		gWalkers.Add(1)
+		defer gWalkers.Add(-1)
 		defer limitworkers.Release(1)
-		// fmt.Println("thread start")
-		// defer fmt.Println("thread done")
 	}
 
 	// goofy special filters
 	if depth <= 1 {
-		if _, ok := fsFilter[dir]; ok {
-			atomic.AddUint64(&filterDirs, 1)
+		if _, ok := cFsFilter[dir]; ok {
+			atomic.AddUint64(&gFilterDirs, 1)
 			if debug {
 				fmt.Fprintf(os.Stderr, "skipping path %s as special\n", dir)
 			}
@@ -143,7 +142,7 @@ func walkGo(db *sql.DB, debug bool, dir string, limitworkers *semaphore.Weighted
 
 	files, err := os.ReadDir(dir)
 	if err != nil {
-		atomic.AddUint64(&dirListErrors, 1)
+		atomic.AddUint64(&gDirListErrors, 1)
 		if debug {
 			fmt.Fprintln(os.Stderr, "Error reading directory:", err)
 		}
@@ -153,54 +152,50 @@ func walkGo(db *sql.DB, debug bool, dir string, limitworkers *semaphore.Weighted
 	for _, file := range files {
 		var cleanPath = filepath.Join(dir, file.Name())
 		if file.IsDir() {
-			countDirs.Add(1)
+			gCountDirs.Add(1)
 
 			if limitworkers.TryAcquire(1) {
-				go walkGo(dbConn, debug, cleanPath, limitworkers, true, depth+1)
+				go walkGo(debug, cleanPath, limitworkers, true, depth+1)
 			} else {
-				walkGo(dbConn, debug, cleanPath, limitworkers, false, depth+1)
+				walkGo(debug, cleanPath, limitworkers, false, depth+1)
 			}
 		} else if file.Type().IsRegular() || (fs.ModeIrregular&file.Type() != 0) {
 			stats, err_st := file.Info()
 			if err_st != nil {
-				atomic.AddUint64(&filestatErrors, 1)
+				atomic.AddUint64(&gFilestatErrors, 1)
 				if debug {
 					fmt.Fprintln(os.Stderr, "... Error reading file info:", err_st)
 				}
 				continue
 			}
 			safePrintf("toscan: %s\n", cleanPath)
-			blocked.Add(1)
+			gHashers.Add(1)
 			modTime := stats.ModTime()
 			sz := stats.Size()
-			hashpool.Submit(func() {
-				goroutines.Add(1)
+			gHashpool.Submit(func() {
 				sha1, err := computeSHA1(cleanPath)
 				fileInfo := FileInfo{
-					ScanTimestamp: startTime, // Current timestamp as scan timestamp
-					Filename:      cleanPath,
-					FileHash:      sha1,
-					ModTime:       modTime,
-					Size:          sz,
+					Filename: cleanPath,
+					FileHash: sha1,
+					ModTime:  modTime,
+					Size:     sz,
 				}
-
-				goroutines.Add(-1)
 				if err == nil {
-					countFiles.Add(1)
+					gCountFiles.Add(1)
 					safePrintf("scanned: %s | %s | %v | %d\n", fileInfo.Filename, fileInfo.FileHash, fileInfo.ModTime, fileInfo.Size)
 				} else {
 					safePrintf("scanned: %s FaIleD: %s\n", cleanPath, err.Error())
 					fmt.Errorf("sha1 error for file \"%s\" of: %s\n", cleanPath, err.Error())
 				}
-				dbpool.Submit(func() {
-					InsertFileInfo(dbConn, fileInfo)
+				gDbpool.Submit(func() {
+					InsertFileInfo(gDbi, fileInfo)
 				})
 			})
-			blocked.Add(-1)
+			gHashers.Add(-1)
 			// uid := getUserId(&stats)
 		} else {
-			atomic.AddUint64(&notDirOrFile, 1)
-			countFileTypes.Compute(file.Type(), func(oldValue int, loaded bool) (newValue int, delete bool) {
+			atomic.AddUint64(&gNotDirOrFile, 1)
+			gCountFileTypes.Compute(file.Type(), func(oldValue int, loaded bool) (newValue int, delete bool) {
 				newValue = oldValue + 1
 				return
 			})
@@ -222,11 +217,12 @@ func walkGo(db *sql.DB, debug bool, dir string, limitworkers *semaphore.Weighted
 
 func main() {
 
-	// start := time.Now()
+	// startTime := time.Now()
 
 	var err error
 
 	_rootDir := flag.String("d", ".", "root directory to scan")
+	dbPath := flag.String("D", "track_db.duckdb", "path to the duckdb database file")
 	ticker_duration := flag.Duration("i", 1*time.Second, "ticker duration")
 	// dumpFullDetails := flag.Bool("D", false, "dump full details")
 	// flatUnits := flag.Bool("F", false, "use basic units for size and age - useful for simpler post processing")
@@ -253,30 +249,18 @@ func main() {
 		return
 	}
 
-	dbPath := "mydatabase.duckdb"
-
 	// Connect to the database
-	dbConn, err = ConnectToDB(dbPath)
+	gDbi, err = NewDbInfo(*dbPath)
 	if err != nil {
 		log.Fatalf("Failed to connect to the database: %v", err)
 	}
-	defer dbConn.Close()
+	defer gDbi.txn.Commit()
+	defer gDbi.conn.Close()
 
-	dbTx, err = dbConn.BeginTx(context.Background(), nil)
-	if err != nil {
-		log.Fatalf("Failed to start transaction on database: %v", err)
-	}
-	defer dbTx.Commit()
+	gHashpool = pond.New(*threadLimit, *threadLimit*4, pond.MinWorkers(*threadLimit))
+	gDbpool = pond.New(1, *threadLimit*5000, pond.MinWorkers(1))
 
-	// Create the table if it doesn't exist
-	if err := CreateTable(dbConn); err != nil {
-		log.Fatalf("Failed to create table: %v", err)
-	}
-
-	hashpool = pond.New(*threadLimit, *threadLimit*4, pond.MinWorkers(*threadLimit))
-	dbpool = pond.New(1, *threadLimit*100, pond.MinWorkers(1))
-
-	ptrOutputFile = ofile
+	gPtrOutputFile = ofile
 
 	// jobs := make(chan string, *threadLimit*2)
 	// for i := 0; i < *threadLimit; i++ {
@@ -286,11 +270,12 @@ func main() {
 	var workerSema = semaphore.NewWeighted(int64(*threadLimit))
 
 	var statList []*statticker.Stat
-	statList = append(statList, countFiles)
-	statList = append(statList, countDirs)
-	statList = append(statList, totalSize)
-	statList = append(statList, goroutines)
-	statList = append(statList, blocked)
+	statList = append(statList, gCountFiles)
+	statList = append(statList, gCountDirs)
+	statList = append(statList, gTotalSize)
+	statList = append(statList, gWalkers)
+	statList = append(statList, gHashers)
+	statList = append(statList, gThreads)
 
 	var ticker *statticker.Ticker
 	if ticker_duration.Seconds() != 0 {
@@ -300,10 +285,16 @@ func main() {
 	var ctx = context.Background()
 	workerSema.Acquire(ctx, 1)
 	fmt.Println("scanning dir: ", rootDir)
-	walkGo(dbConn, *debug, rootDir, workerSema, true, 0)
+	walkGo(*debug, rootDir, workerSema, true, 0)
 	workerSema.Acquire(ctx, int64(*threadLimit))
-	hashpool.StopAndWait()
+	gHashpool.StopAndWait()
 	ticker.Stop()
+
+	// fmt.Printf("%v\n", startTime)
+	err = DbFinalizeStats(gDbi, gStartTime, gCountFiles.Get(), gTotalSize.Get(), time.Since(gStartTime))
+	if err != nil {
+		log.Fatalf("Error while trying to finalize scan stats: %v", err)
+	}
 
 }
 
@@ -315,3 +306,6 @@ func main() {
 // perl -ne 'if ( s/toscan: (.+)/$1/) { print $_;}' sha1.log | sort -T /dev/shm > toscan
 
 // 8414e1ffd1d5bcc80db9918042a492f65181bfbe
+
+// 7010666c27c3e1913dea5af14242411fb3831c21
+// 30849452bc095e7773f47b7014b8b228f7032bc8
