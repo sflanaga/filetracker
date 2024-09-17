@@ -4,11 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
-	_ "github.com/marcboeker/go-duckdb"
+	"github.com/marcboeker/go-duckdb"
 )
+
+func dle(err error, format string) {
+	if err != nil {
+		log.Fatalf(format, err)
+	}
+}
 
 // FileInfo holds the file details to be inserted
 type FileInfo struct {
@@ -26,28 +33,38 @@ var fileInfoPool = sync.Pool{
 }
 
 type DbInfo struct {
-	conn   *sql.DB
-	txn    *sql.Tx
-	stmt   *sql.Stmt
+	db  *sql.DB
+	txn *sql.Tx
+	// stmt   *sql.Stmt
+	app    *duckdb.Appender
 	scanid int64
 }
 
 func NewDbInfo(dbPath string) (*DbInfo, error) {
-	var err error
-	var conn *sql.DB
-	var txn *sql.Tx
-	var stmt *sql.Stmt
+	// var err error
+	// // var conn *sql.DB
+	// var txn *sql.Tx
+	// var stmt *sql.Stmt
+	// var driver driver.Driver
 
-	conn, err = sql.Open("duckdb", dbPath)
+	connector, err := duckdb.NewConnector(dbPath, nil)
 	if err != nil {
-		return nil, err
+		log.Fatalf("new connector error: %v\n", err)
 	}
-	txn, err = conn.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault, ReadOnly: false})
+	conn, err := connector.Connect(context.Background())
 	if err != nil {
-		return nil, err
+		log.Fatalf("new connect error: %v\n", err)
+	}
+
+	db := sql.OpenDB(connector)
+
+	txn, err := db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelDefault, ReadOnly: false})
+	if err != nil {
+		log.Fatalf("begin transaction error: %v\n", err)
 	}
 
 	queries := []string{
+		`begin transaction`,
 		`CREATE SEQUENCE IF NOT EXISTS scan_id_seq START WITH 1`,
 		`CREATE SEQUENCE IF NOT EXISTS id_seq START WITH 1`,
 		`CREATE TABLE IF NOT EXISTS files (
@@ -57,7 +74,7 @@ func NewDbInfo(dbPath string) (*DbInfo, error) {
 			mod_ts TIMESTAMP,
 			size BIGINT
 		)`,
-		`ALTER TABLE files ADD COLUMN if not exists id BIGINT DEFAULT nextval('id_seq');`,
+		// `ALTER TABLE files ADD COLUMN if not exists id BIGINT DEFAULT nextval('id_seq');`,
 		`CREATE TABLE IF NOT EXISTS scans (
 			scan_id bigint,
 			start_scan_ts timestamp,
@@ -65,10 +82,11 @@ func NewDbInfo(dbPath string) (*DbInfo, error) {
 			bytes bigint,
 			exe_time interval
 		)`,
+		`commit`,
 	}
 
 	for _, sql := range queries {
-		_, err = txn.Exec(sql)
+		_, err = db.Exec(sql)
 		if err != nil {
 			return nil, fmt.Errorf("while creating schema: %v\nsql: %s", err, sql)
 		}
@@ -79,31 +97,46 @@ func NewDbInfo(dbPath string) (*DbInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("while getting next scan id: %v", err)
 	}
-
-	stmt, err = txn.PrepareContext(context.Background(), `INSERT INTO files (scan_id, filename, filehash, mod_ts, size)
-	VALUES (?, ?, ?, ?, ?)`)
+	appender, err := duckdb.NewAppenderFromConn(conn, "", "files")
 	if err != nil {
-		return nil, fmt.Errorf("while preparing insert statement: %v", err)
+		log.Fatalf("new appender error: %v\n", err)
 	}
 
+	// stmt, err := txn.PrepareContext(context.Background(), `INSERT INTO files (scan_id, filename, filehash, mod_ts, size)
+	// VALUES (?, ?, ?, ?, ?)`)
+	// if err != nil {
+	// 	log.Fatalf("new connector error: %v\n", err)
+	// }
+
 	info := DbInfo{
-		conn:   conn,
-		txn:    txn,
-		stmt:   stmt,
+		db:  db,
+		txn: txn,
+		// stmt:   stmt,
 		scanid: scanid,
+		app:    appender,
 	}
 
 	return &info, nil
 }
 
-func DbFinalizeStats(dbi *DbInfo, startTime time.Time, fileCount, byteCount int64, exe_time time.Duration) error {
+func DbFinalizeStats(dbi *DbInfo, startTime time.Time, fileCount, byteCount int64, exe_time time.Duration) {
 	_, err := dbi.txn.Exec(`insert into scans(scan_id, start_scan_ts, count, bytes, exe_time) values($1,$2,$3,$4,$5 * INTERVAL '1 milliseconds')`,
 		dbi.scanid, startTime, fileCount, byteCount, exe_time.Milliseconds())
-	return err
+	if err != nil {
+		log.Fatalf("error inserting final scan row stats: %v", err)
+	}
+	dle(dbi.app.Flush(), "app flush error %v")
+	dle(dbi.app.Close(), "app close error %v")
+	dle(dbi.txn.Commit(), "txn commit error %v")
 }
 
 func InsertFileInfo(db *DbInfo, fileInfo *FileInfo) error {
-	_, err := db.stmt.Exec(db.scanid, fileInfo.Filename, fileInfo.FileHash, fileInfo.ModTime, fileInfo.Size)
+	// fmt.Printf("name: %s, mod: %v\n", fileInfo.Filename, fileInfo.ModTime)
+	err := db.app.AppendRow(db.scanid, fileInfo.Filename, fileInfo.FileHash, fileInfo.ModTime, fileInfo.Size)
+	if err != nil {
+		log.Fatalf("row appender error: %v for data: %v\n", err, fileInfo)
+	}
+
 	fileInfoPool.Put(fileInfo)
 	return err
 }

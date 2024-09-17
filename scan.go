@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
-	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"path"
 	"path/filepath"
@@ -103,9 +101,10 @@ var gDbQueue = statticker.NewStat("dbq", statticker.Gauge).WithExternal(func() i
 var gCountFileTypes = xsync.NewMapOf[fs.FileMode, int]()
 
 var cFsFilter = map[string]bool{
-	"/proc": true,
-	"/dev":  true,
-	"/sys":  true,
+	"/proc":     true,
+	"/dev":      true,
+	"/sys":      true,
+	"/swapfile": true,
 }
 
 var gFilestatErrors uint64 = 0
@@ -177,6 +176,9 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 					} else {
 						fileInfo.FileHash = sha1
 					}
+				} else {
+					fileInfo.FileHash = ""
+					gTotalSize.Add(sz)
 				}
 				gCountFiles.Add(1)
 				gDbpool.Submit(func() {
@@ -199,9 +201,9 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 }
 
 func main() {
-	go func() {
-		http.ListenAndServe("localhost:5000", http.DefaultServeMux)
-	}()
+	// go func() {
+	// 	http.ListenAndServe("localhost:5000", http.DefaultServeMux)
+	// }()
 
 	// startTime := time.Now()
 
@@ -209,7 +211,7 @@ func main() {
 
 	_rootDir := flag.String("d", ".", "root directory to scan")
 	dbPath := flag.String("D", "track_db.duckdb", "path to the duckdb database file")
-	_calcHash := *(flag.Bool("H", false, "cut off sha1 calc hash and just scan files"))
+	_calcHashOff := flag.Bool("H", false, "disable sha1 calc hash and just scan files")
 	ticker_duration := flag.Duration("i", 1*time.Second, "ticker duration")
 	// dumpFullDetails := flag.Bool("D", false, "dump full details")
 	// flatUnits := flag.Bool("F", false, "use basic units for size and age - useful for simpler post processing")
@@ -229,7 +231,9 @@ func main() {
 		fmt.Println("Error getting absolute path:", err)
 		return
 	}
-	gCalcHash = _calcHash
+	gCalcHash = !(*_calcHashOff)
+
+	println("calc hash: ", gCalcHash)
 
 	ofile, err := os.OpenFile(*outputFilename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
@@ -243,7 +247,7 @@ func main() {
 		log.Fatalf("Failed to connect to the database: %v", err)
 	}
 	defer gDbi.txn.Commit()
-	defer gDbi.conn.Close()
+	defer gDbi.db.Close()
 
 	gHashpool = pond.New(*threadLimit, *threadLimit*4, pond.MinWorkers(*threadLimit))
 	gDbpool = pond.New(1, *threadLimit*5000, pond.MinWorkers(1))
@@ -280,11 +284,7 @@ func main() {
 	ticker.Stop()
 
 	// fmt.Printf("%v\n", startTime)
-	err = DbFinalizeStats(gDbi, gStartTime, gCountFiles.Get(), gTotalSize.Get(), time.Since(gStartTime))
-	if err != nil {
-		log.Fatalf("Error while trying to finalize scan stats: %v", err)
-	}
-
+	DbFinalizeStats(gDbi, gStartTime, gCountFiles.Get(), gTotalSize.Get(), time.Since(gStartTime))
 }
 
 // OVERALL[stats monitor] 390.863  files: 1,058/s, 413,891 dir: 113/s, 44,463 bytes: 1.36GB/s, 533.18GB goroutines: 0
