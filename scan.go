@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 )
 
 var gCalcHash = true
+var gtickerRootDirs = false
 var gHashpool *pond.WorkerPool
 var gDbpool *pond.WorkerPool
 
@@ -97,7 +99,7 @@ var gWalkers = statticker.NewStat("walk", statticker.Gauge)
 var gHashers = statticker.NewStat("hash", statticker.Gauge)
 var gThreads = statticker.NewStat("threads", statticker.Gauge).WithExternal(getThreadCount)
 var gDbQueue = statticker.NewStat("dbq", statticker.Gauge).WithExternal(func() int64 { return int64(gDbpool.WaitingTasks()) })
-
+var gListRoots = statticker.NewStat("print", statticker.Print).WithPrint(printRootInProgress)
 var gCountFileTypes = xsync.NewMapOf[fs.FileMode, int]()
 
 var cFsFilter = map[string]bool{
@@ -113,9 +115,34 @@ var gDirListErrors uint64 = 0
 
 var gStartTime = time.Now()
 
+var gRootMtx = sync.Mutex{}
+var gRootsInProgress = make(map[string]bool)
+
+func addRootDir(rootDir string) {
+	gRootMtx.Lock()
+	defer gRootMtx.Unlock()
+	gRootsInProgress[rootDir] = true
+}
+func delRootDir(rootDir string) {
+	gRootMtx.Lock()
+	defer gRootMtx.Unlock()
+	delete(gRootsInProgress, rootDir)
+}
+
+func printRootInProgress() {
+	gRootMtx.Lock()
+	strList := maps.Keys(gRootsInProgress)
+	gRootMtx.Unlock()
+	for s := range strList {
+		println("\t", s)
+	}
+}
+
 func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine bool, depth int) {
 	if goroutine {
-		gWalkers.Add(1)
+		if gtickerRootDirs {
+			defer delRootDir(dir)
+		}
 		defer gWalkers.Add(-1)
 		defer limitworkers.Release(1)
 	}
@@ -141,16 +168,27 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 	}
 
 	for _, file := range files {
-		var cleanPath = filepath.Join(dir, file.Name())
 		if file.IsDir() {
 			gCountDirs.Add(1)
-
+			var cleanPath = filepath.Join(dir, file.Name())
 			if limitworkers.TryAcquire(1) {
+				if gtickerRootDirs {
+					addRootDir(cleanPath)
+				}
+				gWalkers.Add(1)
 				go walkGo(debug, cleanPath, limitworkers, true, depth+1)
 			} else {
 				walkGo(debug, cleanPath, limitworkers, false, depth+1)
 			}
+		}
+	}
+
+	for _, file := range files {
+		if file.IsDir() {
+			// ignore one second pass
+			// we start with dirs first to get the spread of workers active
 		} else if file.Type().IsRegular() || (fs.ModeIrregular&file.Type() != 0) {
+			var cleanPath = filepath.Join(dir, file.Name())
 			stats, err_st := file.Info()
 			if err_st != nil {
 				atomic.AddUint64(&gFilestatErrors, 1)
@@ -159,10 +197,11 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 				}
 				continue
 			}
-			gHashers.Add(1)
 			modTime := stats.ModTime()
 			sz := stats.Size()
 			gHashpool.Submit(func() {
+				gHashers.Add(1)
+				defer gHashers.Add(-1)
 				// fileInfo := fileInfoPool.Get().(*FileInfo)
 				// fileInfo.Filename = cleanPath
 				// fileInfo.ModTime = modTime
@@ -185,7 +224,6 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 					InsertFileInfo(gDbi, cleanPath, filehash, modTime, sz)
 				})
 			})
-			gHashers.Add(-1)
 		} else {
 			atomic.AddUint64(&gNotDirOrFile, 1)
 			gCountFileTypes.Compute(file.Type(), func(oldValue int, loaded bool) (newValue int, delete bool) {
@@ -194,7 +232,7 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 			})
 
 			if debug {
-				fmt.Fprintln(os.Stderr, "... skipping file:", cleanPath, " type: ", modeToStringLong(file.Type()))
+				fmt.Fprintln(os.Stderr, "... skipping file:", file, " type: ", modeToStringLong(file.Type()))
 			}
 		}
 	}
@@ -217,13 +255,14 @@ func main() {
 	debug := flag.Bool("v", false, "keep intermediate error messages quiet")
 	outputFilename := flag.String("f", "sha1.log", "output file to write sha1 per file")
 	memprofhttp := flag.Bool("M", false, "activate the mem profile listener")
+	tickerRootDirs := flag.Bool("R", false, "ticker will include root directories still in progress")
 
 	flag.Usage = func() {
 		fmt.Printf("Usage: %s [OPTIONS]\n", path.Base(os.Args[0]))
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-
+	gtickerRootDirs = *tickerRootDirs
 	if *memprofhttp {
 		setupMemMeasure()
 	}
@@ -271,6 +310,9 @@ func main() {
 	statList = append(statList, gHashers)
 	statList = append(statList, gThreads)
 	statList = append(statList, gDbQueue)
+	if gtickerRootDirs {
+		statList = append(statList, gListRoots)
+	}
 
 	var ticker *statticker.Ticker
 	if ticker_duration.Seconds() != 0 {
@@ -278,8 +320,9 @@ func main() {
 		ticker.Start()
 	}
 	var ctx = context.Background()
-	workerSema.Acquire(ctx, 1)
 	fmt.Println("scanning dir: ", rootDir)
+	workerSema.Acquire(ctx, 1)
+	gWalkers.Add(1)
 	walkGo(*debug, rootDir, workerSema, true, 0)
 	workerSema.Acquire(ctx, int64(*threadLimit))
 	gHashpool.StopAndWait()
