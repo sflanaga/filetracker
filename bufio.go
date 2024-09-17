@@ -15,19 +15,27 @@ var byteBufPool = sync.Pool{
 
 var errInvalidWrite = errors.New("invalid write result")
 
+// copy of the io.Copy but changed so that the bytes copied could be more
+// closely monitored
 func MyCopy(dst io.Writer, src io.Reader) (written int64, err error) {
 	return thisCopyBuffer(dst, src)
 }
 
+// So, you cannot force allocation of a 32K byte buffer allocation on the stack
+// so we resort to using a pool... sigh
+// Regardless this GREATLY reduced GC load/message, etc
+// But, note that io.Copy does a direct src to dst Reader/Writer copy
+// that somehow avoids this, BUT I could only get the byte count AFTER
+// a whole file was hashed, which made the stat ticker rather wonky
+//
+// other things looked into:
+//
+//		thread locals - none really - just context but meant for http request pipelines
+//		using goroutine pool in which the full life time of the goroutine could be tapped
+//		but found no thread pool like capability for that in go
+//		if you allocate a static array [32*1024] instead of make, it escapes to heap
+//	I sense the resource pool here might yet be avoided, but this journey ends here.
 func thisCopyBuffer(dst io.Writer, src io.Reader) (written int64, err error) {
-	// If the reader has a WriteTo method, use it to do the copy.
-	// Avoids an allocation and a copy.
-
-	// if wt, ok := src.(io.WriterTo); ok {
-	// 	sz, err := wt.WriteTo(dst)
-	// 	totalSize.Add(sz)
-	// 	return sz, err
-	// }
 
 	bufPtr := byteBufPool.Get().(*[]byte)
 	defer func() {
@@ -35,24 +43,6 @@ func thisCopyBuffer(dst io.Writer, src io.Reader) (written int64, err error) {
 	}()
 	buf := (*bufPtr)[:]
 
-	// bufAlloc := [32768]byte{}
-	// buf := bufAlloc
-
-	// Similarly, if the writer has a ReadFrom method, use it to do the copy.
-	if rf, ok := dst.(io.ReaderFrom); ok {
-		return rf.ReadFrom(src)
-	}
-	// if buf == nil {
-	// 	size := 32 * 1024
-	// 	if l, ok := src.(*io.LimitedReader); ok && int64(size) > l.N {
-	// 		if l.N < 1 {
-	// 			size = 1
-	// 		} else {
-	// 			size = int(l.N)
-	// 		}
-	// 	}
-	// 	buf = make([]byte, size)
-	// }
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {

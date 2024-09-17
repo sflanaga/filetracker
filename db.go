@@ -16,21 +16,6 @@ func dle(err error, format string) {
 	}
 }
 
-// FileInfo holds the file details to be inserted
-// type FileInfo struct {
-// 	Filename string
-// 	FileHash string
-// 	ModTime  time.Time
-// 	Size     int64
-// }
-
-// var fileInfoPool = sync.Pool{
-// 	New: func() interface{} {
-// 		fi := FileInfo{}
-// 		return &fi
-// 	},
-// }
-
 type DbInfo struct {
 	db  *sql.DB
 	txn *sql.Tx
@@ -39,12 +24,8 @@ type DbInfo struct {
 	scanid int64
 }
 
+// create (if needed) a new duckdb and associated schema
 func NewDbInfo(dbPath string) (*DbInfo, error) {
-	// var err error
-	// // var conn *sql.DB
-	// var txn *sql.Tx
-	// var stmt *sql.Stmt
-	// var driver driver.Driver
 
 	connector, err := duckdb.NewConnector(dbPath, nil)
 	if err != nil {
@@ -97,21 +78,18 @@ func NewDbInfo(dbPath string) (*DbInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("while getting next scan id: %v", err)
 	}
+
+	// Note the append here GREATLY (10 to 100x maybe) improves insert performance
+	// but does not use the auto increment sequence that a regular
+	// statement uses
 	appender, err := duckdb.NewAppenderFromConn(conn, "", "files")
 	if err != nil {
 		log.Fatalf("new appender error: %v\n", err)
 	}
 
-	// stmt, err := txn.PrepareContext(context.Background(), `INSERT INTO files (scan_id, filename, filehash, mod_ts, size)
-	// VALUES (?, ?, ?, ?, ?)`)
-	// if err != nil {
-	// 	log.Fatalf("new connector error: %v\n", err)
-	// }
-
 	info := DbInfo{
-		db:  db,
-		txn: txn,
-		// stmt:   stmt,
+		db:     db,
+		txn:    txn,
 		scanid: scanid,
 		app:    appender,
 	}
@@ -119,6 +97,10 @@ func NewDbInfo(dbPath string) (*DbInfo, error) {
 	return &info, nil
 }
 
+// we are done so record any final stats and commit that data
+// In my own tests, appender does not commit until Flush or Close, but the appender docs say that it commits every 204800 rows
+// So, if you start the process and get to 300k files and the process exits early due to an error - nothing should appear in the DB
+// see https://duckdb.org/docs/data/appender.html
 func DbFinalizeStats(dbi *DbInfo, rootDir string, startTime time.Time, fileCount, byteCount int64, exe_time time.Duration) {
 	_, err := dbi.txn.Exec(`insert into scans(scan_id, root_dir, start_scan_ts, count, bytes, exe_time) values($1,$2,$3,$4,$5, $6 * INTERVAL '1 milliseconds')`,
 		dbi.scanid, rootDir, startTime, fileCount, byteCount, exe_time.Milliseconds())
@@ -136,7 +118,5 @@ func InsertFileInfo(dbi *DbInfo, filename string, filehash string, modtime time.
 	if err != nil {
 		log.Fatalf("row appender error: \"%v\" happened on filename: %s\n", err, filename)
 	}
-
-	// fileInfoPool.Put(fileInfo)
 	return err
 }

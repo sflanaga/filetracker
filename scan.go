@@ -1,5 +1,21 @@
 package main
 
+/*
+
+Scan a directory tree for regular files
+Take and record in duckdb table "files":
+	scan_id - new sequence created for each scan
+	full path
+	last mod time,
+	filesize
+	sha1 hash - disable is optional
+record the final scan stats
+
+Note:
+	stats are "ticked" as process runs
+	some roots are skipped if the root directory is "/"
+*/
+
 import (
 	"context"
 	"crypto/sha1"
@@ -22,10 +38,39 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+var cFsFilter = map[string]bool{
+	"/proc": true,
+	"/dev":  true,
+	"/sys":  true,
+}
+
+// "nothing wrong with globals" - famouse last words
 var gCalcHash = true
 var gtickerRootDirs = false
 var gHashpool *pond.WorkerPool
 var gDbpool *pond.WorkerPool
+
+var gDbi *DbInfo
+
+var gTotalSize = statticker.NewStat("bytes", statticker.Bytes)
+var gCountFiles = statticker.NewStat("files", statticker.Count)
+var gCountDirs = statticker.NewStat("dir", statticker.Count)
+var gWalkers = statticker.NewStat("walk", statticker.Gauge)
+var gHashers = statticker.NewStat("hash", statticker.Gauge)
+var gThreads = statticker.NewStat("threads", statticker.Gauge).WithExternal(getThreadCount)
+var gDbQueue = statticker.NewStat("dbq", statticker.Gauge).WithExternal(func() int64 { return int64(gDbpool.WaitingTasks()) })
+var gListRoots = statticker.NewStat("print", statticker.Print).WithPrint(printRootInProgress)
+var gCountFileTypes = xsync.NewMapOf[fs.FileMode, int]()
+
+var gFilestatErrors uint64 = 0
+var gNotDirOrFile uint64 = 0
+var gFilterDirs uint64 = 0
+var gDirListErrors uint64 = 0
+
+var gStartTime = time.Now()
+
+var gRootMtx = sync.Mutex{}
+var gRootsInProgress = make(map[string]bool)
 
 func computeSHA1(filePath string) (string, error) {
 	// Open the file for reading
@@ -74,50 +119,16 @@ func modeToStringLong(mode fs.FileMode) string {
 	return "unknown"
 }
 
-var gPtrOutputFile *os.File
-var gMtxOutputFile sync.Mutex
-
-var gDbi *DbInfo
-
-// var dbConn *sql.DB
-// var dbTx *sql.Tx
-
-func safePrintf(format string, a ...any) {
-	gMtxOutputFile.Lock()
-	defer gMtxOutputFile.Unlock()
-	fmt.Fprintf(gPtrOutputFile, format, a...)
-}
-
 func getThreadCount() int64 {
 	return int64(runtime.NumGoroutine())
 }
 
-var gTotalSize = statticker.NewStat("bytes", statticker.Bytes)
-var gCountFiles = statticker.NewStat("files", statticker.Count)
-var gCountDirs = statticker.NewStat("dir", statticker.Count)
-var gWalkers = statticker.NewStat("walk", statticker.Gauge)
-var gHashers = statticker.NewStat("hash", statticker.Gauge)
-var gThreads = statticker.NewStat("threads", statticker.Gauge).WithExternal(getThreadCount)
-var gDbQueue = statticker.NewStat("dbq", statticker.Gauge).WithExternal(func() int64 { return int64(gDbpool.WaitingTasks()) })
-var gListRoots = statticker.NewStat("print", statticker.Print).WithPrint(printRootInProgress)
-var gCountFileTypes = xsync.NewMapOf[fs.FileMode, int]()
-
-var cFsFilter = map[string]bool{
-	"/proc": true,
-	"/dev":  true,
-	"/sys":  true,
-}
-
-var gFilestatErrors uint64 = 0
-var gNotDirOrFile uint64 = 0
-var gFilterDirs uint64 = 0
-var gDirListErrors uint64 = 0
-
-var gStartTime = time.Now()
-
-var gRootMtx = sync.Mutex{}
-var gRootsInProgress = make(map[string]bool)
-
+// we walkGo spawns another goroutine
+// this records for what directory that happened
+// this list is time to what are those root directories
+// that happen to get a new thread of execution
+// and it can be "interesting" to monitor
+// and NOT consistent between runs
 func addRootDir(rootDir string) {
 	gRootMtx.Lock()
 	defer gRootMtx.Unlock()
@@ -138,6 +149,10 @@ func printRootInProgress() {
 	}
 }
 
+// While the walkGo is multi-threaded, it might be considered overkill given we do hashes by default
+// except that the process can run without getting hashes and record all files
+// note that the hashing is done in a seperate pool from the walk tree
+// and it is this hashing that is the primary bottleneck but ONLY if on.
 func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine bool, depth int) {
 	if goroutine {
 		if gtickerRootDirs {
@@ -167,10 +182,18 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 		return
 	}
 
+	// we scan for the directories first as that allow
+	// other threads to find more work
+	// as this thread might get bogged down in hashes
+	// or very long directory lists
+	// so, yes, we iterate on files twice for that reason
 	for _, file := range files {
 		if file.IsDir() {
 			gCountDirs.Add(1)
 			var cleanPath = filepath.Join(dir, file.Name())
+			// if we have thread capacity - spawn another goroutine
+			// according to the semaphore
+			// waitgroups and channel could
 			if limitworkers.TryAcquire(1) {
 				if gtickerRootDirs {
 					addRootDir(cleanPath)
@@ -202,10 +225,6 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 			gHashpool.Submit(func() {
 				gHashers.Add(1)
 				defer gHashers.Add(-1)
-				// fileInfo := fileInfoPool.Get().(*FileInfo)
-				// fileInfo.Filename = cleanPath
-				// fileInfo.ModTime = modTime
-				// fileInfo.Size = sz
 
 				var filehash string
 				if gCalcHash {
@@ -239,21 +258,16 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 }
 
 func main() {
-
-	// startTime := time.Now()
-
 	var err error
 
+	// note these assignments do not happen under flag.Parse below
 	_rootDir := flag.String("d", ".", "root directory to scan")
 	dbPath := flag.String("D", "track_db.duckdb", "path to the duckdb database file")
 	_calcHashOff := flag.Bool("H", false, "disable sha1 calc hash and just scan files")
 	ticker_duration := flag.Duration("i", 1*time.Second, "ticker duration")
-	// dumpFullDetails := flag.Bool("D", false, "dump full details")
-	// flatUnits := flag.Bool("F", false, "use basic units for size and age - useful for simpler post processing")
 	cpuNum := runtime.NumCPU()
 	threadLimit := flag.Int("t", cpuNum, "limit number of threads")
 	debug := flag.Bool("v", false, "keep intermediate error messages quiet")
-	outputFilename := flag.String("f", "sha1.log", "output file to write sha1 per file")
 	memprofhttp := flag.Bool("M", false, "activate the mem profile listener")
 	tickerRootDirs := flag.Bool("R", false, "ticker will include root directories still in progress")
 
@@ -274,31 +288,17 @@ func main() {
 	}
 	gCalcHash = !(*_calcHashOff)
 
-	println("calc hash: ", gCalcHash)
-
-	ofile, err := os.OpenFile(*outputFilename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		fmt.Println("Error opening file:", err)
-		return
-	}
-
 	// Connect to the database
 	gDbi, err = NewDbInfo(*dbPath)
 	if err != nil {
 		log.Fatalf("Failed to connect to the database: %v", err)
 	}
-	defer gDbi.txn.Commit()
+	// note that we "commit" the data ONLY upon success completion at
+	// the last db call.
 	defer gDbi.db.Close()
 
 	gHashpool = pond.New(*threadLimit, *threadLimit*4, pond.MinWorkers(*threadLimit))
 	gDbpool = pond.New(1, *threadLimit*5000, pond.MinWorkers(1))
-
-	gPtrOutputFile = ofile
-
-	// jobs := make(chan string, *threadLimit*2)
-	// for i := 0; i < *threadLimit; i++ {
-	// 	go shaWorker(i, jobs)
-	// }
 
 	var workerSema = semaphore.NewWeighted(int64(*threadLimit))
 
@@ -328,18 +328,5 @@ func main() {
 	gHashpool.StopAndWait()
 	ticker.Stop()
 
-	// fmt.Printf("%v\n", startTime)
 	DbFinalizeStats(gDbi, rootDir, gStartTime, gCountFiles.Get(), gTotalSize.Get(), time.Since(gStartTime))
 }
-
-// OVERALL[stats monitor] 390.863  files: 1,058/s, 413,891 dir: 113/s, 44,463 bytes: 1.36GB/s, 533.18GB goroutines: 0
-// OVERALL[stats monitor] 372.238  files: 1,113/s, 414,428 dir: 119/s, 44,463 bytes: 1.43GB/s, 533.38GB goroutines: 0
-
-// perl -ne 'if ( s/scanned: (.+) = .+/$1/) { print $_;}' sha1.log | sort -T /dev/shm > scanned
-
-// perl -ne 'if ( s/toscan: (.+)/$1/) { print $_;}' sha1.log | sort -T /dev/shm > toscan
-
-// 8414e1ffd1d5bcc80db9918042a492f65181bfbe
-
-// 7010666c27c3e1913dea5af14242411fb3831c21
-// 30849452bc095e7773f47b7014b8b228f7032bc8
