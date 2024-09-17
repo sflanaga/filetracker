@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	"github.com/marcboeker/go-duckdb"
@@ -18,19 +17,19 @@ func dle(err error, format string) {
 }
 
 // FileInfo holds the file details to be inserted
-type FileInfo struct {
-	Filename string
-	FileHash string
-	ModTime  time.Time
-	Size     int64
-}
+// type FileInfo struct {
+// 	Filename string
+// 	FileHash string
+// 	ModTime  time.Time
+// 	Size     int64
+// }
 
-var fileInfoPool = sync.Pool{
-	New: func() interface{} {
-		fi := FileInfo{}
-		return &fi
-	},
-}
+// var fileInfoPool = sync.Pool{
+// 	New: func() interface{} {
+// 		fi := FileInfo{}
+// 		return &fi
+// 	},
+// }
 
 type DbInfo struct {
 	db  *sql.DB
@@ -77,6 +76,7 @@ func NewDbInfo(dbPath string) (*DbInfo, error) {
 		// `ALTER TABLE files ADD COLUMN if not exists id BIGINT DEFAULT nextval('id_seq');`,
 		`CREATE TABLE IF NOT EXISTS scans (
 			scan_id bigint,
+			root_dir text,
 			start_scan_ts timestamp,
 			count bigint,
 			bytes bigint,
@@ -119,9 +119,9 @@ func NewDbInfo(dbPath string) (*DbInfo, error) {
 	return &info, nil
 }
 
-func DbFinalizeStats(dbi *DbInfo, startTime time.Time, fileCount, byteCount int64, exe_time time.Duration) {
-	_, err := dbi.txn.Exec(`insert into scans(scan_id, start_scan_ts, count, bytes, exe_time) values($1,$2,$3,$4,$5 * INTERVAL '1 milliseconds')`,
-		dbi.scanid, startTime, fileCount, byteCount, exe_time.Milliseconds())
+func DbFinalizeStats(dbi *DbInfo, rootDir string, startTime time.Time, fileCount, byteCount int64, exe_time time.Duration) {
+	_, err := dbi.txn.Exec(`insert into scans(scan_id, root_dir, start_scan_ts, count, bytes, exe_time) values($1,$2,$3,$4,$5, $6 * INTERVAL '1 milliseconds')`,
+		dbi.scanid, rootDir, startTime, fileCount, byteCount, exe_time.Milliseconds())
 	if err != nil {
 		log.Fatalf("error inserting final scan row stats: %v", err)
 	}
@@ -130,13 +130,13 @@ func DbFinalizeStats(dbi *DbInfo, startTime time.Time, fileCount, byteCount int6
 	dle(dbi.txn.Commit(), "txn commit error %v")
 }
 
-func InsertFileInfo(db *DbInfo, fileInfo *FileInfo) error {
+func InsertFileInfo(dbi *DbInfo, filename string, filehash string, modtime time.Time, filesize int64) error {
 	// fmt.Printf("name: %s, mod: %v\n", fileInfo.Filename, fileInfo.ModTime)
-	err := db.app.AppendRow(db.scanid, fileInfo.Filename, fileInfo.FileHash, fileInfo.ModTime, fileInfo.Size)
+	err := dbi.app.AppendRow(dbi.scanid, filename, filehash, modtime, filesize) //fileInfo.Filename, fileInfo.FileHash, fileInfo.ModTime, fileInfo.Size)
 	if err != nil {
-		log.Fatalf("row appender error: %v for data: %v\n", err, fileInfo)
+		log.Fatalf("row appender error: \"%v\" happened on filename: %s\n", err, filename)
 	}
 
-	fileInfoPool.Put(fileInfo)
+	// fileInfoPool.Put(fileInfo)
 	return err
 }

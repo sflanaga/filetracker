@@ -101,10 +101,9 @@ var gDbQueue = statticker.NewStat("dbq", statticker.Gauge).WithExternal(func() i
 var gCountFileTypes = xsync.NewMapOf[fs.FileMode, int]()
 
 var cFsFilter = map[string]bool{
-	"/proc":     true,
-	"/dev":      true,
-	"/sys":      true,
-	"/swapfile": true,
+	"/proc": true,
+	"/dev":  true,
+	"/sys":  true,
 }
 
 var gFilestatErrors uint64 = 0
@@ -164,25 +163,26 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 			modTime := stats.ModTime()
 			sz := stats.Size()
 			gHashpool.Submit(func() {
-				fileInfo := fileInfoPool.Get().(*FileInfo)
-				fileInfo.Filename = cleanPath
-				fileInfo.ModTime = modTime
-				fileInfo.Size = sz
+				// fileInfo := fileInfoPool.Get().(*FileInfo)
+				// fileInfo.Filename = cleanPath
+				// fileInfo.ModTime = modTime
+				// fileInfo.Size = sz
 
+				var filehash string
 				if gCalcHash {
 					sha1, err := computeSHA1(cleanPath)
 					if err != nil {
 						fmt.Errorf("sha1 error for file \"%s\" of: %s\n", cleanPath, err.Error())
 					} else {
-						fileInfo.FileHash = sha1
+						filehash = sha1
 					}
 				} else {
-					fileInfo.FileHash = ""
+					filehash = ""
 					gTotalSize.Add(sz)
 				}
 				gCountFiles.Add(1)
 				gDbpool.Submit(func() {
-					InsertFileInfo(gDbi, fileInfo)
+					InsertFileInfo(gDbi, cleanPath, filehash, modTime, sz)
 				})
 			})
 			gHashers.Add(-1)
@@ -201,9 +201,6 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 }
 
 func main() {
-	// go func() {
-	// 	http.ListenAndServe("localhost:5000", http.DefaultServeMux)
-	// }()
 
 	// startTime := time.Now()
 
@@ -219,12 +216,17 @@ func main() {
 	threadLimit := flag.Int("t", cpuNum, "limit number of threads")
 	debug := flag.Bool("v", false, "keep intermediate error messages quiet")
 	outputFilename := flag.String("f", "sha1.log", "output file to write sha1 per file")
+	memprofhttp := flag.Bool("M", false, "activate the mem profile listener")
 
 	flag.Usage = func() {
 		fmt.Printf("Usage: %s [OPTIONS]\n", path.Base(os.Args[0]))
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *memprofhttp {
+		setupMemMeasure()
+	}
 
 	rootDir, err := filepath.Abs(*_rootDir)
 	if err != nil {
@@ -284,7 +286,7 @@ func main() {
 	ticker.Stop()
 
 	// fmt.Printf("%v\n", startTime)
-	DbFinalizeStats(gDbi, gStartTime, gCountFiles.Get(), gTotalSize.Get(), time.Since(gStartTime))
+	DbFinalizeStats(gDbi, rootDir, gStartTime, gCountFiles.Get(), gTotalSize.Get(), time.Since(gStartTime))
 }
 
 // OVERALL[stats monitor] 390.863  files: 1,058/s, 413,891 dir: 113/s, 44,463 bytes: 1.36GB/s, 533.18GB goroutines: 0
