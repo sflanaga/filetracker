@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path"
 	"path/filepath"
@@ -21,6 +23,7 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+var gCalcHash = true
 var gHashpool *pond.WorkerPool
 var gDbpool *pond.WorkerPool
 
@@ -95,6 +98,7 @@ var gCountDirs = statticker.NewStat("dir", statticker.Count)
 var gWalkers = statticker.NewStat("walk", statticker.Gauge)
 var gHashers = statticker.NewStat("hash", statticker.Gauge)
 var gThreads = statticker.NewStat("threads", statticker.Gauge).WithExternal(getThreadCount)
+var gDbQueue = statticker.NewStat("dbq", statticker.Gauge).WithExternal(func() int64 { return int64(gDbpool.WaitingTasks()) })
 
 var gCountFileTypes = xsync.NewMapOf[fs.FileMode, int]()
 
@@ -110,17 +114,6 @@ var gFilterDirs uint64 = 0
 var gDirListErrors uint64 = 0
 
 var gStartTime = time.Now()
-
-func shaWorker(id int, jobs <-chan string) {
-	for filename := range jobs {
-		sha1, err := computeSHA1(filename)
-		if err == nil {
-			safePrintf("scanned: %s = %s\n", filename, string(sha1))
-		} else {
-			fmt.Errorf("sha1 error for file \"%s\" of: %s\n", filename, err.Error())
-		}
-	}
-}
 
 func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine bool, depth int) {
 	if goroutine {
@@ -168,31 +161,29 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 				}
 				continue
 			}
-			safePrintf("toscan: %s\n", cleanPath)
 			gHashers.Add(1)
 			modTime := stats.ModTime()
 			sz := stats.Size()
 			gHashpool.Submit(func() {
-				sha1, err := computeSHA1(cleanPath)
-				fileInfo := FileInfo{
-					Filename: cleanPath,
-					FileHash: sha1,
-					ModTime:  modTime,
-					Size:     sz,
+				fileInfo := fileInfoPool.Get().(*FileInfo)
+				fileInfo.Filename = cleanPath
+				fileInfo.ModTime = modTime
+				fileInfo.Size = sz
+
+				if gCalcHash {
+					sha1, err := computeSHA1(cleanPath)
+					if err != nil {
+						fmt.Errorf("sha1 error for file \"%s\" of: %s\n", cleanPath, err.Error())
+					} else {
+						fileInfo.FileHash = sha1
+					}
 				}
-				if err == nil {
-					gCountFiles.Add(1)
-					safePrintf("scanned: %s | %s | %v | %d\n", fileInfo.Filename, fileInfo.FileHash, fileInfo.ModTime, fileInfo.Size)
-				} else {
-					safePrintf("scanned: %s FaIleD: %s\n", cleanPath, err.Error())
-					fmt.Errorf("sha1 error for file \"%s\" of: %s\n", cleanPath, err.Error())
-				}
+				gCountFiles.Add(1)
 				gDbpool.Submit(func() {
 					InsertFileInfo(gDbi, fileInfo)
 				})
 			})
 			gHashers.Add(-1)
-			// uid := getUserId(&stats)
 		} else {
 			atomic.AddUint64(&gNotDirOrFile, 1)
 			gCountFileTypes.Compute(file.Type(), func(oldValue int, loaded bool) (newValue int, delete bool) {
@@ -200,22 +191,17 @@ func walkGo(debug bool, dir string, limitworkers *semaphore.Weighted, goroutine 
 				return
 			})
 
-			// _, _ = countFileTypes.LoadOrStore(key, func(value interface{}) interface{} {
-			// 	if value == nil {
-			// 		return 1
-			// 	}
-			// 	return value.(V) + 1
-			// })
 			if debug {
 				fmt.Fprintln(os.Stderr, "... skipping file:", cleanPath, " type: ", modeToStringLong(file.Type()))
 			}
 		}
 	}
-	// loadUserInfo(user)
-
 }
 
 func main() {
+	go func() {
+		http.ListenAndServe("localhost:5000", http.DefaultServeMux)
+	}()
 
 	// startTime := time.Now()
 
@@ -223,6 +209,7 @@ func main() {
 
 	_rootDir := flag.String("d", ".", "root directory to scan")
 	dbPath := flag.String("D", "track_db.duckdb", "path to the duckdb database file")
+	_calcHash := *(flag.Bool("H", false, "cut off sha1 calc hash and just scan files"))
 	ticker_duration := flag.Duration("i", 1*time.Second, "ticker duration")
 	// dumpFullDetails := flag.Bool("D", false, "dump full details")
 	// flatUnits := flag.Bool("F", false, "use basic units for size and age - useful for simpler post processing")
@@ -242,6 +229,7 @@ func main() {
 		fmt.Println("Error getting absolute path:", err)
 		return
 	}
+	gCalcHash = _calcHash
 
 	ofile, err := os.OpenFile(*outputFilename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
@@ -276,6 +264,7 @@ func main() {
 	statList = append(statList, gWalkers)
 	statList = append(statList, gHashers)
 	statList = append(statList, gThreads)
+	statList = append(statList, gDbQueue)
 
 	var ticker *statticker.Ticker
 	if ticker_duration.Seconds() != 0 {

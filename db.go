@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 	"time"
 
 	_ "github.com/marcboeker/go-duckdb"
@@ -15,6 +16,13 @@ type FileInfo struct {
 	FileHash string
 	ModTime  time.Time
 	Size     int64
+}
+
+var fileInfoPool = sync.Pool{
+	New: func() interface{} {
+		fi := FileInfo{}
+		return &fi
+	},
 }
 
 type DbInfo struct {
@@ -94,7 +102,8 @@ func DbFinalizeStats(dbi *DbInfo, startTime time.Time, fileCount, byteCount int6
 	return err
 }
 
-func InsertFileInfo(db *DbInfo, fileInfo FileInfo) error {
+func InsertFileInfo(db *DbInfo, fileInfo *FileInfo) error {
 	_, err := db.stmt.Exec(db.scanid, fileInfo.Filename, fileInfo.FileHash, fileInfo.ModTime, fileInfo.Size)
+	fileInfoPool.Put(fileInfo)
 	return err
 }
